@@ -1,8 +1,14 @@
 """
-The ingestion pipeline = the conductor. Routes stay thin; the real sequence lives
-here so it's testable and readable top-to-bottom:
-  1. exact-dup check (hash, free)  2. save to disk  3. extract (+OCR)
-  4. chunk -> embed  5. near-dup check (semantic)  6. upsert to Pinecone  7. mark indexed
+pipeline.py — The ingestion conductor.
+
+Routes stay thin; the real sequence lives here so it's testable top-to-bottom:
+  1. Exact-dup check  (hash, free)
+  2. Save to disk
+  3. Extract text (+OCR if needed)
+  4. Chunk → embed
+  5. Near-dup check  (semantic, all chunk vectors)
+  6. Upsert to Pinecone
+  7. Mark indexed
 """
 import os
 import uuid
@@ -28,23 +34,33 @@ class DuplicateError(Exception):
 def _save_file(file_bytes: bytes, original_filename: str) -> str:
     os.makedirs(settings.STORAGE_DIR, exist_ok=True)
     ext = os.path.splitext(original_filename)[1].lower()
-    stored_name = f"{uuid.uuid4().hex}{ext}"   # UUID name => no path traversal, no collisions
+    stored_name = f"{uuid.uuid4().hex}{ext}"   # UUID name → no path traversal, no collisions
     stored_path = os.path.join(settings.STORAGE_DIR, stored_name)
     with open(stored_path, "wb") as f:
         f.write(file_bytes)
     return stored_path
 
 
-def ingest(db: Session, *, file_bytes: bytes, original_filename: str, owner,
-           title: str = None, tags: list = None) -> Document:
+def ingest(
+    db: Session,
+    *,
+    file_bytes: bytes,
+    original_filename: str,
+    owner,
+    title: str = None,
+    tags: list = None,
+) -> Document:
     tags = tags or []
 
-    # 1. EXACT duplicate (before spending any money/CPU)
+    # 1. EXACT duplicate — before spending any money/CPU
     file_hash = sha256_of_bytes(file_bytes)
     existing = dedup.find_exact_duplicate(db, file_hash)
     if existing:
-        raise DuplicateError(f"Identical file already exists (document id {existing.id}).",
-                             existing_id=existing.id, kind="exact")
+        raise DuplicateError(
+            f"Identical file already exists (document id {existing.id}).",
+            existing_id=existing.id,
+            kind="exact",
+        )
 
     # 2. Save to disk
     stored_path = _save_file(file_bytes, original_filename)
@@ -54,9 +70,15 @@ def ingest(db: Session, *, file_bytes: bytes, original_filename: str, owner,
         raise ValueError(f"Unsupported file type: {original_filename}")
 
     doc = Document(
-        original_filename=original_filename, stored_path=stored_path, file_hash=file_hash,
-        doc_type=doc_type, size_bytes=len(file_bytes), owner_id=owner.id,
-        title=title or original_filename, tags=tags, status=DocStatus.processing,
+        original_filename=original_filename,
+        stored_path=stored_path,
+        file_hash=file_hash,
+        doc_type=doc_type,
+        size_bytes=len(file_bytes),
+        owner_id=owner.id,
+        title=title or original_filename,
+        tags=tags,
+        status=DocStatus.processing,
         upload_date=datetime.utcnow(),
     )
     db.add(doc)
@@ -79,23 +101,33 @@ def ingest(db: Session, *, file_bytes: bytes, original_filename: str, owner,
             db.commit()
             return doc
 
-        # 4. Embed
+        # 4. Embed all chunks
         vectors = embeddings.embed_texts(chunks)
 
-        # 5. NEAR-duplicate (first chunk's vector as a representative sample)
-        near_id, score = dedup.find_near_duplicate(vectors[0])
+        # 5. NEAR-duplicate — pass ALL vectors so dedup can sample representatively
+        #    (previously only vectors[0] was passed, giving a cover-page-biased result)
+        near_id, score = dedup.find_near_duplicate(vectors)
         if near_id and near_id != doc.id:
             doc.status = DocStatus.duplicate
             doc.duplicate_of_id = near_id
-            doc.error_message = f"Near-duplicate of document {near_id} (similarity {score:.3f})."
+            doc.error_message = (
+                f"Near-duplicate of document {near_id} (similarity {score:.3f})."
+            )
             db.commit()
-            raise DuplicateError(f"Near-duplicate of document {near_id} (similarity {score:.3f}).",
-                                 existing_id=near_id, kind="near", score=score)
+            raise DuplicateError(
+                f"Near-duplicate of document {near_id} (similarity {score:.3f}).",
+                existing_id=near_id,
+                kind="near",
+                score=score,
+            )
 
         # 6. Upsert to Pinecone with metadata for hybrid filtering
         base_md = {
-            "document_id": doc.id, "title": doc.title, "doc_type": doc.doc_type,
-            "owner_id": doc.owner_id, "tags": tags,
+            "document_id": doc.id,
+            "title": doc.title,
+            "doc_type": doc.doc_type,
+            "owner_id": doc.owner_id,
+            "tags": tags,
             "upload_ts": int(doc.upload_date.timestamp()),
         }
         n = vectorstore.upsert_chunks(doc.id, chunks, vectors, base_md)
