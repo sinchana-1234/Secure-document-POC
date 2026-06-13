@@ -86,7 +86,6 @@ def _build_user_detail(db: Session, user: User) -> UserDetail:
         email=user.email,
         full_name=user.full_name,
         role=user.role.value,
-        department=user.department,
         created_at=user.created_at,
         document_count=doc_count,
     )
@@ -103,7 +102,6 @@ def _build_document_admin_out(doc: Document, owner: Optional[User]) -> DocumentA
         title=doc.title,
         doc_type=doc.doc_type,
         size_bytes=doc.size_bytes,
-        department=doc.department,
         tags=doc.tags or [],
         page_count=doc.page_count,
         num_chunks=doc.num_chunks,
@@ -157,14 +155,13 @@ def list_users(
     db: Session = Depends(get_db),
     _admin: User = Depends(require_admin),
     role: Optional[str] = Query(None, description="Filter by role: 'user' or 'admin'"),
-    department: Optional[str] = Query(None, description="Filter by department"),
     search: Optional[str] = Query(None, description="Search by name or email (case-insensitive)"),
     limit: int = Query(default=50, le=100, description="Max records to return (cap 100)"),
     offset: int = Query(default=0, ge=0, description="Records to skip for pagination"),
 ):
     """
     Returns all platform users. Supports free-text search on email + full_name,
-    and filtering by role / department. Each record includes a document_count.
+    and filtering by role. Each record includes a document_count.
     """
     query = db.query(User)
 
@@ -172,9 +169,6 @@ def list_users(
         if role not in ("user", "admin"):
             raise HTTPException(status_code=400, detail="role must be 'user' or 'admin'")
         query = query.filter(User.role == role)
-
-    if department:
-        query = query.filter(User.department.ilike(f"%{department}%"))
 
     if search:
         # ILIKE = case-insensitive LIKE in PostgreSQL
@@ -214,7 +208,6 @@ def create_user(
         hashed_password=hash_password(payload.password),
         full_name=payload.full_name,
         role=role,
-        department=payload.department,
     )
     db.add(new_user)
     db.commit()
@@ -257,9 +250,6 @@ def update_user(
 
     if payload.full_name is not None:
         user.full_name = payload.full_name
-
-    if payload.department is not None:
-        user.department = payload.department
 
     if payload.role is not None:
         if payload.role not in ("user", "admin"):
@@ -312,7 +302,6 @@ def list_all_documents(
     _admin: User = Depends(require_admin),
     status: Optional[str] = Query(None, description="indexed, failed, duplicate, processing"),
     doc_type: Optional[str] = Query(None, description="pdf, docx, txt, image"),
-    department: Optional[str] = Query(None),
     owner_id: Optional[int] = Query(None, description="Filter to a specific user's uploads"),
     search: Optional[str] = Query(None, description="Search title or filename"),
     limit: int = Query(default=50, le=100),
@@ -320,7 +309,7 @@ def list_all_documents(
 ):
     """
     Admin-scoped document list — no owner filter applied, ALL documents visible.
-    Supports filtering by status, type, department, owner, and free-text search.
+    Supports filtering by status, type, owner, and free-text search.
     """
     query = db.query(Document)
 
@@ -328,8 +317,6 @@ def list_all_documents(
         query = query.filter(Document.status == status)
     if doc_type:
         query = query.filter(Document.doc_type == doc_type)
-    if department:
-        query = query.filter(Document.department.ilike(f"%{department}%"))
     if owner_id:
         query = query.filter(Document.owner_id == owner_id)
     if search:

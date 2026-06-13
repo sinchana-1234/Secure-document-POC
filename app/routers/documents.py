@@ -19,6 +19,7 @@ from app.models import User, Role, Document, DocStatus
 from app.schemas import DocumentOut, UploadResponse
 from app.services import vectorstore
 from app.services.pipeline import ingest, DuplicateError
+from app.services.extraction import ExtractionError
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 
@@ -61,6 +62,8 @@ async def upload(
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))   # missing keys -> clear 503, not hidden 500
+    except ExtractionError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     return UploadResponse(status=doc.status.value, document=DocumentOut.model_validate(doc))
 

@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     JWT_SECRET: str
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 480
+    # ----- OpenAI -----
+    OPENAI_API_KEY: str                       # REQUIRED — from .env (it's a credential)
+    EMBEDDING_MODEL: str = "text-embedding-3-small"
+    EMBEDDING_DIM: int = 1536                 # must match the model above
 
     # PostgreSQL (REQUIRED — only from .env, no default)
     DATABASE_URL: str

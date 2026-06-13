@@ -17,4 +17,3 @@ class User(Base):
     full_name       = Column(String(255), nullable=True)
     role            = Column(SAEnum(Role), nullable=False, default=Role.user)
     created_at      = Column(DateTime, default=datetime.utcnow)
-    department      = Column(String(100), nullable=True)

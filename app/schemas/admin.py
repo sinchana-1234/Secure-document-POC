@@ -25,14 +25,12 @@ from pydantic import BaseModel, EmailStr, Field
 class AdminUserCreate(BaseModel):
     """
     Payload for admin creating a new user.
-    Unlike public registration, admin can explicitly assign any role and
-    department without restriction.
+    Unlike public registration, admin can explicitly assign any role without restriction.
     """
     email: EmailStr
     password: str = Field(min_length=6, description="Minimum 6 characters")
     full_name: Optional[str] = None
     role: str = Field(default="user", description="'user' or 'admin'")
-    department: Optional[str] = None
 
 
 class AdminUserUpdate(BaseModel):
@@ -42,7 +40,6 @@ class AdminUserUpdate(BaseModel):
     """
     full_name: Optional[str] = None
     role: Optional[str] = None          # 'user' | 'admin'
-    department: Optional[str] = None
     password: Optional[str] = Field(default=None, min_length=6)
 
 
@@ -56,7 +53,6 @@ class UserDetail(BaseModel):
     email: EmailStr
     full_name: Optional[str]
     role: str
-    department: Optional[str]
     created_at: Optional[datetime]
     document_count: int = 0             # computed in the route, not a DB column
 
@@ -78,7 +74,6 @@ class DocumentAdminOut(BaseModel):
     title: Optional[str]
     doc_type: str
     size_bytes: int
-    department: Optional[str]
     tags: Optional[List[str]] = []
     page_count: Optional[int]
     num_chunks: Optional[int]

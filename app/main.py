@@ -23,6 +23,11 @@ logger = logging.getLogger("doc-intel")
 async def lifespan(_: FastAPI):
     logger.info("Starting %s (env=%s)", settings.APP_NAME, settings.ENV)
     Base.metadata.create_all(bind=engine)
+    from app.services import vectorstore
+    try:
+        vectorstore.ensure_index()
+    except Exception as e:
+        logger.warning("Could not ensure Pinecone index at startup: %s", e)
     logger.info("Database tables ensured.")
     yield
     logger.info("Shutting down.")
