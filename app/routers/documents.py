@@ -35,7 +35,6 @@ async def upload(
     file: UploadFile = File(...),
     title: Optional[str] = Form(None),
     tags: Optional[str] = Form(None),
-    department: Optional[str] = Form(None),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -54,7 +53,7 @@ async def upload(
 
     try:
         doc = ingest(db, file_bytes=contents, original_filename=file.filename, owner=user,
-                     title=title, tags=parsed_tags, department=department)
+                     title=title, tags=parsed_tags)
     except DuplicateError as e:
         return UploadResponse(status="duplicate", message=str(e), duplicate_of_id=e.existing_id,
                               duplicate_kind=e.kind, similarity=e.score)
@@ -72,7 +71,6 @@ def list_documents(
     user: User = Depends(get_current_user),
     q: Optional[str] = Query(None, description="keyword in title/filename/text"),
     doc_type: Optional[str] = None,
-    department: Optional[str] = None,
     tag: Optional[str] = None,
     status: Optional[str] = None,
     date_from: Optional[datetime] = None,
@@ -90,8 +88,7 @@ def list_documents(
         )
     if doc_type:
         query = query.filter(Document.doc_type == doc_type)
-    if department:
-        query = query.filter(Document.department == department)
+    
     if status:
         query = query.filter(Document.status == status)
     if tag:

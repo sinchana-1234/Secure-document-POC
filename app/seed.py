@@ -6,7 +6,7 @@ from app.database import SessionLocal, Base, engine
 from app.models import User, Role
 from app.core.security import hash_password
 
-DEFAULT_ADMIN_EMAIL = "admin@docintel.local"
+DEFAULT_ADMIN_EMAIL = "admin@gmail.com"
 DEFAULT_ADMIN_PASSWORD = "Admin@123"   # CHANGE after first login
 
 
@@ -19,7 +19,7 @@ def main():
             return
         admin = User(
             email=DEFAULT_ADMIN_EMAIL, hashed_password=hash_password(DEFAULT_ADMIN_PASSWORD),
-            full_name="Platform Admin", role=Role.admin, department="IT",
+            full_name="Platform Admin", role=Role.admin, 
         )
         db.add(admin)
         db.commit()

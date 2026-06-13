@@ -23,7 +23,7 @@ def register(payload: UserCreate, db: Session = Depends(get_db), admin: User = D
     role = Role.admin if payload.role == "admin" else Role.user
     user = User(
         email=payload.email, hashed_password=hash_password(payload.password),
-        full_name=payload.full_name, role=role, department=payload.department,
+        full_name=payload.full_name, role=role, 
     )
     db.add(user)
     db.commit()

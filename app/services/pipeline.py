@@ -36,9 +36,8 @@ def _save_file(file_bytes: bytes, original_filename: str) -> str:
 
 
 def ingest(db: Session, *, file_bytes: bytes, original_filename: str, owner,
-           title: str = None, tags: list = None, department: str = None) -> Document:
+           title: str = None, tags: list = None) -> Document:
     tags = tags or []
-    department = department or owner.department
 
     # 1. EXACT duplicate (before spending any money/CPU)
     file_hash = sha256_of_bytes(file_bytes)
@@ -56,7 +55,7 @@ def ingest(db: Session, *, file_bytes: bytes, original_filename: str, owner,
 
     doc = Document(
         original_filename=original_filename, stored_path=stored_path, file_hash=file_hash,
-        doc_type=doc_type, size_bytes=len(file_bytes), owner_id=owner.id, department=department,
+        doc_type=doc_type, size_bytes=len(file_bytes), owner_id=owner.id,
         title=title or original_filename, tags=tags, status=DocStatus.processing,
         upload_date=datetime.utcnow(),
     )
@@ -96,7 +95,7 @@ def ingest(db: Session, *, file_bytes: bytes, original_filename: str, owner,
         # 6. Upsert to Pinecone with metadata for hybrid filtering
         base_md = {
             "document_id": doc.id, "title": doc.title, "doc_type": doc.doc_type,
-            "department": doc.department or "", "owner_id": doc.owner_id, "tags": tags,
+            "owner_id": doc.owner_id, "tags": tags,
             "upload_ts": int(doc.upload_date.timestamp()),
         }
         n = vectorstore.upsert_chunks(doc.id, chunks, vectors, base_md)

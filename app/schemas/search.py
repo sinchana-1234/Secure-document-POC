@@ -9,7 +9,6 @@ class SearchRequest(BaseModel):
     top_k: Optional[int] = None
     doc_type: Optional[str] = None
     tags: Optional[List[str]] = None
-    department: Optional[str] = None
     date_from: Optional[datetime] = None
     date_to: Optional[datetime] = None
 

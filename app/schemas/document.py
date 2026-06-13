@@ -10,7 +10,6 @@ class DocumentOut(BaseModel):
     title: Optional[str]
     doc_type: str
     size_bytes: int
-    department: Optional[str]
     tags: Optional[List[str]] = []
     page_count: Optional[int]
     num_chunks: Optional[int]

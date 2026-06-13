@@ -23,14 +23,12 @@ def _client_or_raise() -> OpenAI:
     return _client
 
 
-def build_metadata_filter(*, doc_type=None, tags=None, department=None,
+def build_metadata_filter(*, doc_type=None, tags=None, 
                           owner_ids=None, date_from_ts=None, date_to_ts=None) -> Optional[Dict[str, Any]]:
     """Translate user filters into Pinecone's Mongo-style operators ($eq/$in/$gte/$lte)."""
     f: Dict[str, Any] = {}
     if doc_type:
         f["doc_type"] = {"$eq": doc_type}
-    if department:
-        f["department"] = {"$eq": department}
     if tags:
         f["tags"] = {"$in": tags if isinstance(tags, list) else [tags]}
     if owner_ids:
