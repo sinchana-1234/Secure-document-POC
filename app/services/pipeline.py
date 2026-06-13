@@ -34,6 +34,8 @@ from app.utils.hashing import sha256_of_bytes
 
 logger = logging.getLogger("doc-poc.pipeline")
 
+import logging
+logger = logging.getLogger("doc-poc.pipeline")
 
 class DuplicateError(Exception):
     def __init__(self, message: str, existing_id: int, kind: str, score: float = None):
@@ -126,7 +128,6 @@ def ingest(
 
         # 4. Embed all chunks
         vectors = embeddings.embed_texts(chunks)
-
         # 5. NEAR-duplicate check — scoped to this owner, self-excluded so a
         #    re-processed document cannot match its own previously upserted vectors.
         near_id, score = dedup.find_near_duplicate(

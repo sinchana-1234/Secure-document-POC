@@ -20,6 +20,9 @@ from app.schemas import DocumentOut, UploadResponse
 from app.services import vectorstore
 from app.services.pipeline import ingest, DuplicateError
 from app.services.extraction import ExtractionError
+from app.services.embeddings import EmbeddingError
+from app.services.vectorstore import VectorStoreError
+from fastapi.responses import FileResponse
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 
@@ -64,6 +67,8 @@ async def upload(
         raise HTTPException(status_code=503, detail=str(e))   # missing keys -> clear 503, not hidden 500
     except ExtractionError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except (EmbeddingError, VectorStoreError) as e:
+        raise HTTPException(status_code=503, detail=f"Indexing failed: {e}")
 
     return UploadResponse(status=doc.status.value, document=DocumentOut.model_validate(doc))
 
@@ -111,6 +116,20 @@ def get_document(doc_id: int, db: Session = Depends(get_db), user: User = Depend
         raise HTTPException(status_code=404, detail="Document not found")
     return doc
 
+@router.get("/{doc_id}/download")
+def download_document(doc_id: int, db: Session = Depends(get_db),
+                      user: User = Depends(get_current_user)):
+    # _scoped_query enforces RBAC: a user can only reach their own docs; admin reaches all.
+    doc = _scoped_query(db, user).filter(Document.id == doc_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if not doc.stored_path or not os.path.exists(doc.stored_path):
+        raise HTTPException(status_code=404, detail="The file is no longer available on disk.")
+    return FileResponse(
+        path=doc.stored_path,
+        filename=doc.original_filename,
+        media_type=doc.mime_type or "application/octet-stream",
+    )
 
 @router.delete("/{doc_id}")
 def delete_document(doc_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):

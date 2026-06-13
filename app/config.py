@@ -30,7 +30,6 @@ class Settings(BaseSettings):
 
     # PostgreSQL
     DATABASE_URL: str                           # REQUIRED — from .env
-
     # Pinecone
     PINECONE_API_KEY: str                       # REQUIRED — from .env
     PINECONE_INDEX: str
