@@ -10,18 +10,27 @@ LAYER 1  EXACT  (free, instant)
 
 LAYER 2  NEAR-DUPLICATE  (semantic, only runs if layer 1 passes)
     A report re-exported as a new PDF, or a document with only a timestamp
-    changed, will have different bytes but almost identical meaning.  We embed
-    a representative sample of the document's chunks and query Pinecone for the
-    nearest existing vectors.  If the average cosine similarity of the sample
-    exceeds NEAR_DUP_THRESHOLD the document is flagged as a near-duplicate.
+    changed, will have different bytes but almost identical meaning.
 
-    Sampling strategy: we take the FIRST, LAST, and up to (SAMPLE_SIZE - 2)
-    evenly-spaced middle chunks.  This gives a better cross-document picture
-    than using only the first chunk, which is often a cover page or boilerplate.
+    Strategy: we select a representative sample of chunk indices (first, last,
+    and evenly-spaced middle chunks), then query Pinecone INDEPENDENTLY for
+    each sampled vector — top-3 matches per probe.  Results are grouped by
+    document_id and averaged.  A document is flagged as a near-duplicate only
+    when the SAME existing document_id appears in at least MIN_CHUNK_HITS
+    probes AND its average score meets or exceeds NEAR_DUP_THRESHOLD.
+
+    Why independent queries instead of an averaged centroid?
+    Averaging chunk vectors before querying produces a centroid that points
+    toward the mean topic space of the document rather than any specific
+    content.  This centroid matches the most "average" chunk of any large
+    document in the index, not a near-duplicate specifically.  Independent
+    per-chunk queries then aggregated by document_id are both more precise
+    (fewer false positives from boilerplate) and more robust (a near-dup
+    with slightly shifted wording still accumulates multiple hits).
 
 WHY NOT JUST ONE CHECK?
     Exact match is O(1) with a DB index and costs nothing.
-    Near-dup requires an OpenAI embedding call + a Pinecone query, so we only
+    Near-dup requires an OpenAI embedding call + Pinecone queries, so we only
     pay that cost when the file is provably new bytes.
 
 THREAD SAFETY
@@ -30,7 +39,8 @@ THREAD SAFETY
 from __future__ import annotations
 
 import logging
-from typing import List, Optional, Tuple
+from collections import defaultdict
+from typing import Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
@@ -45,10 +55,22 @@ logger = logging.getLogger("doc-poc.dedup")
 # Tunables
 # ---------------------------------------------------------------------------
 
-# How many chunk vectors to average when probing for near-duplicates.
-# More samples = more accurate, but more Pinecone queries.
+# How many chunk vectors to sample when probing for near-duplicates.
+# Each sampled chunk becomes one independent Pinecone query (top-3).
+# More samples = more accurate, but more API calls.
 # 5 is a good balance for most document sizes.
 _SAMPLE_SIZE = 5
+
+# How many of the sampled chunks must match the SAME existing document
+# before we consider it a near-duplicate.  Requiring >= 2 hits eliminates
+# false positives from boilerplate chunks (cover pages, footers, disclaimers)
+# that appear identically across many unrelated documents.
+_MIN_CHUNK_HITS = 2
+
+# How many nearest neighbours to fetch per probe query.
+# top-3 gives us enough signal to find the right document_id even when the
+# closest chunk belongs to a different doc (e.g. shared boilerplate).
+_TOP_K_PER_PROBE = 3
 
 
 # ---------------------------------------------------------------------------
@@ -102,47 +124,35 @@ def _select_sample_indices(total: int, sample_size: int) -> List[int]:
     return sorted(indices)
 
 
-def _average_vector(vectors: List[List[float]]) -> List[float]:
-    """
-    Component-wise average of a list of vectors.
-    Returns a unit-length representative vector for the sample set.
-    """
-    if not vectors:
-        raise ValueError("Cannot average an empty list of vectors.")
-
-    dim = len(vectors[0])
-    avg = [0.0] * dim
-    for v in vectors:
-        for i, x in enumerate(v):
-            avg[i] += x
-
-    n = len(vectors)
-    avg = [x / n for x in avg]
-
-    # L2-normalise so cosine similarity == dot product in Pinecone
-    magnitude = sum(x * x for x in avg) ** 0.5
-    if magnitude > 0:
-        avg = [x / magnitude for x in avg]
-
-    return avg
-
-
 def find_near_duplicate(
     vectors: List[List[float]],
+    owner_id: int,
+    exclude_doc_id: Optional[int] = None,
 ) -> Tuple[Optional[int], float]:
     """
     Check whether a new document is semantically near-duplicate of an existing one.
+
+    Each sampled chunk vector is queried against Pinecone independently.
+    Results are grouped by document_id.  A near-duplicate is declared only
+    when the same document_id accumulates at least _MIN_CHUNK_HITS probe
+    matches AND its average similarity meets NEAR_DUP_THRESHOLD.
 
     Parameters
     ----------
     vectors:
         All chunk embeddings for the new document (from embeddings.embed_texts).
+    owner_id:
+        The uploading user's ID.  Pinecone queries are scoped to this owner so
+        users cannot inadvertently learn about each other's documents.
+    exclude_doc_id:
+        Optional document ID to exclude from results.  Pass the new document's
+        own ID when re-processing to prevent self-matches.
 
     Returns
     -------
     (existing_document_id, similarity_score)
         existing_document_id is None if no near-duplicate is found.
-        similarity_score is the cosine similarity of the sample probe (0–1).
+        similarity_score is the average cosine similarity of matched probes (0–1).
 
     Raises
     ------
@@ -156,64 +166,87 @@ def find_near_duplicate(
 
     # 1. Select a representative sample of chunk indices
     sample_indices = _select_sample_indices(len(vectors), _SAMPLE_SIZE)
-    sample_vectors = [vectors[i] for i in sample_indices]
 
     logger.debug(
-        "Near-dup probe: %d total chunks, sampling indices %s",
+        "Near-dup probe: %d total chunks, sampling indices %s (owner_id=%d, exclude=%s)",
         len(vectors),
         sample_indices,
+        owner_id,
+        exclude_doc_id,
     )
 
-    # 2. Average the sample into a single representative vector
-    probe_vector = _average_vector(sample_vectors)
+    # 2. Query each sampled chunk vector independently and accumulate scores
+    #    grouped by document_id.
+    scores_by_doc: Dict[int, List[float]] = defaultdict(list)
 
-    # 3. Query Pinecone for the closest existing vector
-    try:
-        nearest = vectorstore.find_nearest(probe_vector)
-    except VectorStoreAPIError as exc:
-        # Non-fatal: log and allow the upload to proceed
-        logger.warning(
-            "Near-duplicate check skipped — Pinecone query failed: %s", exc
-        )
+    for idx in sample_indices:
+        try:
+            matches = vectorstore.query_for_dedup(
+                vector=vectors[idx],
+                owner_id=owner_id,
+                top_k=_TOP_K_PER_PROBE,
+                exclude_doc_id=exclude_doc_id,
+            )
+        except VectorStoreAPIError as exc:
+            # Non-fatal: a single probe failure is logged and skipped.
+            # If ALL probes fail the loop exits and we return (None, 0.0) below.
+            logger.warning(
+                "Near-dup probe %d skipped — Pinecone query failed: %s", idx, exc
+            )
+            continue
+
+        for match in matches:
+            doc_id_raw = match.get("metadata", {}).get("document_id")
+            score = float(match.get("score", 0.0))
+            if doc_id_raw is not None:
+                scores_by_doc[int(doc_id_raw)].append(score)
+
+    if not scores_by_doc:
+        # Index is empty or every probe failed
+        logger.debug("No Pinecone matches across all probes; no near-duplicate.")
         return None, 0.0
 
-    if nearest is None:
-        # Index is empty — first document, definitely not a duplicate
-        logger.debug("Pinecone index is empty; no near-duplicate possible.")
-        return None, 0.0
+    # 3. Find the best candidate: must have enough hits AND meet the threshold
+    best_doc_id: Optional[int] = None
+    best_avg_score: float = 0.0
 
-    score = float(nearest.get("score", 0.0))
-    doc_id_raw = nearest.get("metadata", {}).get("document_id")
+    for doc_id, scores in scores_by_doc.items():
+        if len(scores) < _MIN_CHUNK_HITS:
+            logger.debug(
+                "doc_id=%d: only %d/%d required chunk hits — skipping.",
+                doc_id,
+                len(scores),
+                _MIN_CHUNK_HITS,
+            )
+            continue
 
-    logger.debug(
-        "Nearest Pinecone match: score=%.4f, document_id=%s",
-        score,
-        doc_id_raw,
-    )
+        avg_score = sum(scores) / len(scores)
 
-    if score < settings.NEAR_DUP_THRESHOLD:
         logger.debug(
-            "Score %.4f < threshold %.4f — not a near-duplicate.",
-            score,
+            "doc_id=%d: %d chunk hits, avg_score=%.4f (threshold=%.4f)",
+            doc_id,
+            len(scores),
+            avg_score,
             settings.NEAR_DUP_THRESHOLD,
         )
-        return None, score
 
-    # Score meets or exceeds threshold
-    if doc_id_raw is None:
-        logger.warning(
-            "Near-duplicate threshold exceeded (score=%.4f) but metadata "
-            "missing document_id — cannot identify the original. Allowing upload.",
-            score,
+        if avg_score >= settings.NEAR_DUP_THRESHOLD and avg_score > best_avg_score:
+            best_doc_id = doc_id
+            best_avg_score = avg_score
+
+    if best_doc_id is None:
+        logger.debug(
+            "No document met both the hit count (%d) and threshold (%.4f) criteria.",
+            _MIN_CHUNK_HITS,
+            settings.NEAR_DUP_THRESHOLD,
         )
-        return None, score
+        return None, best_avg_score
 
-    existing_id = int(doc_id_raw)
     logger.info(
-        "Near-duplicate detected: similarity=%.4f >= threshold=%.4f, "
+        "Near-duplicate detected: avg_similarity=%.4f >= threshold=%.4f, "
         "matches document id=%d",
-        score,
+        best_avg_score,
         settings.NEAR_DUP_THRESHOLD,
-        existing_id,
+        best_doc_id,
     )
-    return existing_id, score
+    return best_doc_id, best_avg_score

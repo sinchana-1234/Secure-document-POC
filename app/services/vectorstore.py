@@ -8,8 +8,9 @@ similar ones (with metadata filters), and removing a document's vectors.
 from __future__ import annotations
 
 import logging
+import threading
 import time
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional
 
 from pinecone import Pinecone, ServerlessSpec
 
@@ -33,6 +34,10 @@ class VectorStoreAPIError(VectorStoreError):
 _UPSERT_BATCH = 100
 _INDEX_READY_TIMEOUT_S = 120
 
+# Module-level singletons — guarded by _lock to prevent double-initialisation
+# under concurrent FastAPI requests (multiple threads can all see None at once
+# without the lock, each calling ensure_index() and create_index() in parallel).
+_lock: threading.Lock = threading.Lock()
 _pc: Optional[Pinecone] = None
 _index = None
 
@@ -55,8 +60,13 @@ def _client() -> Pinecone:
     global _pc
     if not settings.PINECONE_API_KEY:
         raise VectorStoreConfigError("PINECONE_API_KEY is not set. Add it to backend/.env.")
-    if _pc is None:
-        _pc = Pinecone(api_key=settings.PINECONE_API_KEY)
+    # Fast path — client already built, no lock needed (read of a reference is atomic in CPython)
+    if _pc is not None:
+        return _pc
+    with _lock:
+        # Re-check inside the lock: another thread may have built it while we waited
+        if _pc is None:
+            _pc = Pinecone(api_key=settings.PINECONE_API_KEY)
     return _pc
 
 
@@ -81,9 +91,14 @@ def ensure_index() -> None:
         raise VectorStoreAPIError(f"Could not list Pinecone indexes: {e}") from e
 
     if settings.PINECONE_INDEX not in existing:
-        logger.info("Creating Pinecone index '%s' (dim=%s, metric=%s, %s/%s)",
-                    settings.PINECONE_INDEX, settings.EMBEDDING_DIM, settings.PINECONE_METRIC,
-                    settings.PINECONE_CLOUD, settings.PINECONE_REGION)
+        logger.info(
+            "Creating Pinecone index '%s' (dim=%s, metric=%s, %s/%s)",
+            settings.PINECONE_INDEX,
+            settings.EMBEDDING_DIM,
+            settings.PINECONE_METRIC,
+            settings.PINECONE_CLOUD,
+            settings.PINECONE_REGION,
+        )
         try:
             pc.create_index(
                 name=settings.PINECONE_INDEX,
@@ -107,14 +122,23 @@ def ensure_index() -> None:
 
 def get_index():
     global _index
-    if _index is None:
-        ensure_index()
-        _index = _client().Index(settings.PINECONE_INDEX)
+    # Fast path — index already initialised
+    if _index is not None:
+        return _index
+    with _lock:
+        # Re-check inside the lock: another thread may have initialised it while we waited
+        if _index is None:
+            ensure_index()
+            _index = _client().Index(settings.PINECONE_INDEX)
     return _index
 
 
-def upsert_chunks(document_id: int, chunks: List[str], vectors: List[List[float]],
-                  base_metadata: Dict[str, Any]) -> int:
+def upsert_chunks(
+    document_id: int,
+    chunks: List[str],
+    vectors: List[List[float]],
+    base_metadata: Dict[str, Any],
+) -> int:
     """Store one vector per chunk. Returns how many were upserted."""
     if len(chunks) != len(vectors):
         raise VectorStoreError(f"chunks ({len(chunks)}) and vectors ({len(vectors)}) length mismatch.")
@@ -147,13 +171,20 @@ def upsert_chunks(document_id: int, chunks: List[str], vectors: List[List[float]
     return upserted
 
 
-def query(vector: List[float], top_k: int,
-          metadata_filter: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+def query(
+    vector: List[float],
+    top_k: int,
+    metadata_filter: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     """Semantic search + optional metadata filter (the 'hybrid' part)."""
     index = get_index()
     try:
-        res = index.query(vector=vector, top_k=top_k, include_metadata=True,
-                          filter=metadata_filter or None)
+        res = index.query(
+            vector=vector,
+            top_k=top_k,
+            include_metadata=True,
+            filter=metadata_filter or None,
+        )
     except Exception as e:  # noqa: BLE001
         raise VectorStoreAPIError(f"Pinecone query failed: {e}") from e
 
@@ -167,8 +198,59 @@ def query(vector: List[float], top_k: int,
     return out
 
 
+def query_for_dedup(
+    vector: List[float],
+    owner_id: int,
+    top_k: int,
+    exclude_doc_id: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Scoped near-duplicate probe — used exclusively by dedup.find_near_duplicate.
+
+    Differences from the general query():
+    - Always filters by owner_id so users cannot match against each other's documents.
+    - Optionally excludes a specific document_id (to avoid self-match during re-processing).
+    - Returns top_k matches so the caller can aggregate scores across probes by document_id.
+
+    Parameters
+    ----------
+    vector:
+        A single chunk embedding to probe with.
+    owner_id:
+        Restrict results to documents owned by this user.
+    top_k:
+        Number of nearest neighbours to return per probe.
+    exclude_doc_id:
+        If provided, results from this document_id are filtered out.
+        Pass the new document's own ID when re-processing an existing record.
+
+    Returns
+    -------
+    List of match dicts with keys: id, score, metadata.
+    Empty list if the index is empty or no matches are found.
+    """
+    # Build the filter — always scope to owner, optionally exclude self
+    pinecone_filter: Dict[str, Any] = {"owner_id": {"$eq": owner_id}}
+    if exclude_doc_id is not None:
+        pinecone_filter["document_id"] = {"$ne": exclude_doc_id}
+
+    logger.debug(
+        "query_for_dedup: owner_id=%d, exclude_doc_id=%s, top_k=%d",
+        owner_id,
+        exclude_doc_id,
+        top_k,
+    )
+
+    return query(vector=vector, top_k=top_k, metadata_filter=pinecone_filter)
+
+
 def find_nearest(vector: List[float]) -> Optional[Dict[str, Any]]:
-    """Top-1 match across everything — used by near-duplicate detection."""
+    """
+    Top-1 match across everything — used by RAG search, not dedup.
+
+    For near-duplicate detection use query_for_dedup() instead, which
+    applies owner scoping and self-exclusion.
+    """
     matches = query(vector, top_k=1, metadata_filter=None)
     return matches[0] if matches else None
 

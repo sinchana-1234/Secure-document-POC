@@ -5,13 +5,13 @@ Admin router — all routes require the caller to be an admin (enforced by the
 ENDPOINTS
 ─────────
 GET  /api/admin/stats                 Platform-wide summary counts
-GET  /api/admin/users                 Paginated + filterable user list
+GET  /api/admin/users                 Paginated + filterable user list (with total)
 POST /api/admin/users                 Create a new user (any role)
 GET  /api/admin/users/{user_id}       Single user detail with document count
-PATCH /api/admin/users/{user_id}      Partial update (role, dept, password, name)
-DELETE /api/admin/users/{user_id}     Soft-safe delete (blocks self-delete)
-GET  /api/admin/documents             Paginated + filterable file list (all users)
-DELETE /api/admin/documents/{doc_id}  Hard-delete a document (disk + DB)
+PATCH /api/admin/users/{user_id}      Partial update (role, password, name)
+DELETE /api/admin/users/{user_id}     Delete user + all their documents (cascade)
+GET  /api/admin/documents             Paginated + filterable file list (with total)
+DELETE /api/admin/documents/{doc_id}  Hard-delete a document (Pinecone + disk + DB)
 
 RBAC DESIGN
 ───────────
@@ -23,32 +23,42 @@ privilege-escalation bugs.
 PAGINATION
 ──────────
 All list endpoints accept `limit` (page size, max 100) and `offset` (skip N rows).
-This keeps response payloads bounded regardless of dataset size.
+Responses are wrapped in UserListResponse / DocumentListResponse which include a
+`total` count so the frontend can render correct page navigation.
+
+QUERY EFFICIENCY
+────────────────
+list_users: one GROUP BY subquery fetches all document counts — O(1) queries total.
+list_all_documents: a single JOIN resolves owner info — O(1) queries total.
+Neither endpoint scales linearly with result size.
 """
 
-import os
 import logging
-from typing import List, Optional
+import os
+from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Depends, HTTPException, Query, status as http_status
+from sqlalchemy import func
+from sqlalchemy.orm import Session, joinedload
 
 from app.core.deps import require_admin
 from app.core.security import hash_password
 from app.database import get_db
-from app.models import User, Role, Document, DocStatus
+from app.models import Document, DocStatus, Role, User
 from app.schemas.admin import (
     AdminUserCreate,
     AdminUserUpdate,
-    UserDetail,
-    DocumentAdminOut,
     AdminStats,
+    DocumentAdminOut,
+    DocumentListResponse,
+    UserDetail,
+    UserListResponse,
 )
 from app.services import vectorstore
+from app.services.vectorstore import VectorStoreAPIError
 
 logger = logging.getLogger("doc-intel.admin")
 
-# All routes live under /api/admin — prefix enforced here, not in main.py
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
 
@@ -57,13 +67,13 @@ router = APIRouter(prefix="/api/admin", tags=["admin"])
 # ---------------------------------------------------------------------------
 
 def _get_user_or_404(db: Session, user_id: int) -> User:
-    """
-    Centralised lookup so every endpoint raises the same 404 shape.
-    Avoids repeating the query + raise pattern in every handler.
-    """
+    """Centralised lookup — raises the same 404 shape from every endpoint."""
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"User {user_id} not found")
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=f"User {user_id} not found",
+        )
     return user
 
 
@@ -71,16 +81,40 @@ def _get_document_or_404(db: Session, doc_id: int) -> Document:
     """Same pattern for documents."""
     doc = db.query(Document).filter(Document.id == doc_id).first()
     if not doc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Document {doc_id} not found")
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=f"Document {doc_id} not found",
+        )
     return doc
 
 
-def _build_user_detail(db: Session, user: User) -> UserDetail:
+def _remove_file(path: str) -> None:
+    """Delete a stored file, logging rather than raising if it is already gone."""
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.warning("Could not remove stored file '%s': %s", path, exc)
+
+
+def _doc_count_subquery(db: Session):
     """
-    Attach the document count to a User ORM object and return the Pydantic schema.
-    COUNT is a single aggregated query — no Python-level iteration over rows.
+    Returns a subquery that maps owner_id → document count.
+    Used by list_users to avoid N+1 COUNT queries.
     """
-    doc_count = db.query(Document).filter(Document.owner_id == user.id).count()
+    return (
+        db.query(
+            Document.owner_id.label("owner_id"),
+            func.count(Document.id).label("doc_count"),
+        )
+        .group_by(Document.owner_id)
+        .subquery()
+    )
+
+
+def _build_user_detail(user: User, doc_count: int) -> UserDetail:
+    """Build a UserDetail from an ORM row + precomputed count."""
     return UserDetail(
         id=user.id,
         email=user.email,
@@ -91,11 +125,12 @@ def _build_user_detail(db: Session, user: User) -> UserDetail:
     )
 
 
-def _build_document_admin_out(doc: Document, owner: Optional[User]) -> DocumentAdminOut:
+def _build_document_admin_out(doc: Document) -> DocumentAdminOut:
     """
-    Enrich a Document ORM object with its owner's email and name.
-    Owner is already loaded by the join in the list query, so no extra hit.
+    Build DocumentAdminOut from a Document whose .owner is already loaded
+    via joinedload — no extra query fired here.
     """
+    owner = doc.owner
     return DocumentAdminOut(
         id=doc.id,
         original_filename=doc.original_filename,
@@ -131,11 +166,9 @@ def get_stats(
     """
     total_users = db.query(User).count()
     total_docs  = db.query(Document).count()
-
-    # Simple individual counts — clear and cheap enough for an admin panel
-    indexed   = db.query(Document).filter(Document.status == DocStatus.indexed).count()
-    failed    = db.query(Document).filter(Document.status == DocStatus.failed).count()
-    duplicate = db.query(Document).filter(Document.status == DocStatus.duplicate).count()
+    indexed     = db.query(Document).filter(Document.status == DocStatus.indexed).count()
+    failed      = db.query(Document).filter(Document.status == DocStatus.failed).count()
+    duplicate   = db.query(Document).filter(Document.status == DocStatus.duplicate).count()
 
     return AdminStats(
         total_users=total_users,
@@ -150,7 +183,7 @@ def get_stats(
 # User Management
 # ---------------------------------------------------------------------------
 
-@router.get("/users", response_model=List[UserDetail], summary="List all users with document counts")
+@router.get("/users", response_model=UserListResponse, summary="List all users with document counts")
 def list_users(
     db: Session = Depends(get_db),
     _admin: User = Depends(require_admin),
@@ -160,31 +193,44 @@ def list_users(
     offset: int = Query(default=0, ge=0, description="Records to skip for pagination"),
 ):
     """
-    Returns all platform users. Supports free-text search on email + full_name,
-    and filtering by role. Each record includes a document_count.
+    Returns all platform users with a total count for pagination.
+    Document counts come from a single GROUP BY subquery — not one COUNT per user.
     """
-    query = db.query(User)
+    if role and role not in ("user", "admin"):
+        raise HTTPException(status_code=400, detail="role must be 'user' or 'admin'")
+
+    # One subquery gives us all document counts grouped by owner — O(1) DB calls
+    counts_sq = _doc_count_subquery(db)
+
+    query = (
+        db.query(User, func.coalesce(counts_sq.c.doc_count, 0).label("doc_count"))
+        .outerjoin(counts_sq, User.id == counts_sq.c.owner_id)
+    )
 
     if role:
-        if role not in ("user", "admin"):
-            raise HTTPException(status_code=400, detail="role must be 'user' or 'admin'")
         query = query.filter(User.role == role)
 
     if search:
-        # ILIKE = case-insensitive LIKE in PostgreSQL
         like = f"%{search}%"
         query = query.filter(
             (User.email.ilike(like)) | (User.full_name.ilike(like))
         )
 
-    # Stable ordering (newest first) so pagination is deterministic
-    users = query.order_by(User.created_at.desc()).offset(offset).limit(limit).all()
+    # Get total before applying pagination
+    total = query.count()
 
-    return [_build_user_detail(db, u) for u in users]
+    rows = query.order_by(User.created_at.desc()).offset(offset).limit(limit).all()
+
+    items = [_build_user_detail(user, int(doc_count)) for user, doc_count in rows]
+    return UserListResponse(items=items, total=total)
 
 
-@router.post("/users", response_model=UserDetail, status_code=status.HTTP_201_CREATED,
-             summary="Create a new user (admin or regular)")
+@router.post(
+    "/users",
+    response_model=UserDetail,
+    status_code=http_status.HTTP_201_CREATED,
+    summary="Create a new user (admin or regular)",
+)
 def create_user(
     payload: AdminUserCreate,
     db: Session = Depends(get_db),
@@ -193,28 +239,26 @@ def create_user(
     """
     Admin-only user creation. Unlike the public /register endpoint, this allows
     creating admin-role accounts. Password is bcrypt-hashed before storage.
+    role is validated to Literal["user","admin"] by the schema — no extra check needed.
     """
-    # Prevent duplicate emails at the application layer
     if db.query(User).filter(User.email == payload.email).first():
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
+            status_code=http_status.HTTP_409_CONFLICT,
             detail=f"Email '{payload.email}' is already registered",
         )
-
-    role = Role.admin if payload.role == "admin" else Role.user
 
     new_user = User(
         email=payload.email,
         hashed_password=hash_password(payload.password),
         full_name=payload.full_name,
-        role=role,
+        role=Role.admin if payload.role == "admin" else Role.user,
     )
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
 
-    logger.info("Admin created user id=%d email=%s role=%s", new_user.id, new_user.email, role.value)
-    return _build_user_detail(db, new_user)
+    logger.info("Admin created user id=%d email=%s role=%s", new_user.id, new_user.email, new_user.role.value)
+    return _build_user_detail(new_user, 0)
 
 
 @router.get("/users/{user_id}", response_model=UserDetail, summary="Get single user detail")
@@ -225,7 +269,8 @@ def get_user(
 ):
     """Returns full detail for one user, including their document upload count."""
     user = _get_user_or_404(db, user_id)
-    return _build_user_detail(db, user)
+    doc_count = db.query(Document).filter(Document.owner_id == user_id).count()
+    return _build_user_detail(user, doc_count)
 
 
 @router.patch("/users/{user_id}", response_model=UserDetail, summary="Partially update a user")
@@ -238,13 +283,13 @@ def update_user(
     """
     Partial update — only fields present in the request body are changed.
     Admins cannot demote themselves to prevent accidental lockout.
+    role is validated to Literal["user","admin"] by the schema.
     """
     user = _get_user_or_404(db, user_id)
 
-    # Guard: admin cannot accidentally demote their own account
     if user.id == admin.id and payload.role == "user":
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=http_status.HTTP_400_BAD_REQUEST,
             detail="You cannot demote your own admin account",
         )
 
@@ -252,55 +297,87 @@ def update_user(
         user.full_name = payload.full_name
 
     if payload.role is not None:
-        if payload.role not in ("user", "admin"):
-            raise HTTPException(status_code=400, detail="role must be 'user' or 'admin'")
         user.role = Role.admin if payload.role == "admin" else Role.user
 
     if payload.password is not None:
-        # Re-hash the new password — never store plain text
         user.hashed_password = hash_password(payload.password)
 
     db.commit()
     db.refresh(user)
 
+    doc_count = db.query(Document).filter(Document.owner_id == user.id).count()
     logger.info("Admin updated user id=%d", user.id)
-    return _build_user_detail(db, user)
+    return _build_user_detail(user, doc_count)
 
 
-@router.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT,
-               summary="Delete a user account")
+@router.delete(
+    "/users/{user_id}",
+    status_code=http_status.HTTP_204_NO_CONTENT,
+    summary="Delete a user and all their documents",
+)
 def delete_user(
     user_id: int,
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin),
 ):
     """
-    Permanently deletes a user. Admin cannot delete their own account
-    to prevent last-admin lockout.
+    Permanently deletes a user and ALL their documents in three steps per document:
+      1. Pinecone vectors removed
+      2. Disk file removed
+      3. DB rows removed (user delete cascades to documents via FK)
+
+    Admin cannot delete their own account to prevent last-admin lockout.
     """
     if user_id == admin.id:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=http_status.HTTP_400_BAD_REQUEST,
             detail="You cannot delete your own admin account",
         )
 
     user = _get_user_or_404(db, user_id)
+
+    # Fetch all documents belonging to this user before deleting the user row
+    docs = db.query(Document).filter(Document.owner_id == user_id).all()
+
+    for doc in docs:
+        # 1. Remove Pinecone vectors for indexed documents
+        if doc.status == DocStatus.indexed:
+            try:
+                vectorstore.delete_document(doc.id)
+            except VectorStoreAPIError as exc:
+                # Non-fatal — log and continue; DB + disk cleanup still proceeds
+                logger.warning(
+                    "Could not delete Pinecone vectors for doc %d (user %d): %s",
+                    doc.id, user_id, exc,
+                )
+
+        # 2. Remove disk file
+        if doc.stored_path:
+            _remove_file(doc.stored_path)
+
+    # 3. Delete the user — FK cascade (ondelete="CASCADE") removes Document rows
     db.delete(user)
     db.commit()
 
-    logger.info("Admin deleted user id=%d email=%s", user_id, user.email)
+    logger.info(
+        "Admin deleted user id=%d email=%s — %d documents cleaned up",
+        user_id, user.email, len(docs),
+    )
 
 
 # ---------------------------------------------------------------------------
 # Document / File Management (admin sees ALL users' files)
 # ---------------------------------------------------------------------------
 
-@router.get("/documents", response_model=List[DocumentAdminOut],
-            summary="List all uploaded files across all users")
+@router.get(
+    "/documents",
+    response_model=DocumentListResponse,
+    summary="List all uploaded files across all users",
+)
 def list_all_documents(
     db: Session = Depends(get_db),
     _admin: User = Depends(require_admin),
-    status: Optional[str] = Query(None, description="indexed, failed, duplicate, processing"),
+    doc_status: Optional[str] = Query(None, description="indexed, failed, duplicate, processing"),
     doc_type: Optional[str] = Query(None, description="pdf, docx, txt, image"),
     owner_id: Optional[int] = Query(None, description="Filter to a specific user's uploads"),
     search: Optional[str] = Query(None, description="Search title or filename"),
@@ -308,36 +385,53 @@ def list_all_documents(
     offset: int = Query(default=0, ge=0),
 ):
     """
-    Admin-scoped document list — no owner filter applied, ALL documents visible.
-    Supports filtering by status, type, owner, and free-text search.
+    Admin-scoped document list — all documents visible regardless of owner.
+    Owner info is resolved via a single JOIN — no N+1 per-document queries.
+    Returns items + total for frontend pagination.
     """
-    query = db.query(Document)
+    # joinedload ensures doc.owner is populated in the same query — no N+1
+    query = db.query(Document).options(joinedload(Document.owner))
 
-    if status:
-        query = query.filter(Document.status == status)
+    if doc_status:
+        # Convert raw string to DocStatus enum before filtering.
+        # Passing a raw string to SAEnum comparison fails silently on some
+        # DB backends — the enum conversion makes it explicit and reliable.
+        try:
+            status_enum = DocStatus(doc_status)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid status '{doc_status}'. Must be one of: {[s.value for s in DocStatus]}",
+            )
+        query = query.filter(Document.status == status_enum)
+
     if doc_type:
         query = query.filter(Document.doc_type == doc_type)
+
     if owner_id:
         query = query.filter(Document.owner_id == owner_id)
+
     if search:
         like = f"%{search}%"
         query = query.filter(
             (Document.title.ilike(like)) | (Document.original_filename.ilike(like))
         )
 
-    # Newest first — most recent uploads are most interesting to reviewers
+    total = query.count()
+
     docs = query.order_by(Document.upload_date.desc()).offset(offset).limit(limit).all()
 
-    results = []
-    for doc in docs:
-        owner = db.query(User).filter(User.id == doc.owner_id).first()
-        results.append(_build_document_admin_out(doc, owner))
-
-    return results
+    return DocumentListResponse(
+        items=[_build_document_admin_out(doc) for doc in docs],
+        total=total,
+    )
 
 
-@router.delete("/documents/{doc_id}", status_code=status.HTTP_204_NO_CONTENT,
-               summary="Hard-delete a document (Pinecone + disk + DB)")
+@router.delete(
+    "/documents/{doc_id}",
+    status_code=http_status.HTTP_204_NO_CONTENT,
+    summary="Hard-delete a document (Pinecone + disk + DB)",
+)
 def delete_document(
     doc_id: int,
     db: Session = Depends(get_db),
@@ -348,6 +442,9 @@ def delete_document(
       1. Pinecone vectors — deleted first; stale vectors cause phantom search results
       2. Disk file — raw uploaded file removed
       3. PostgreSQL row — metadata record deleted last
+
+    VectorStoreAPIError (not RuntimeError) is caught so a Pinecone outage
+    does not block DB + disk cleanup.
     """
     doc = _get_document_or_404(db, doc_id)
 
@@ -356,13 +453,13 @@ def delete_document(
         try:
             vectorstore.delete_document(doc.id)
             logger.info("Deleted Pinecone vectors for document id=%d", doc.id)
-        except RuntimeError as exc:
-            # Log but don't abort — Pinecone being down shouldn't block DB cleanup
+        except VectorStoreAPIError as exc:
+            # Non-fatal — Pinecone being down should not block DB + disk cleanup
             logger.warning("Could not delete Pinecone vectors for doc %d: %s", doc.id, exc)
 
     # 2. Remove the raw file from disk
-    if doc.stored_path and os.path.exists(doc.stored_path):
-        os.remove(doc.stored_path)
+    if doc.stored_path:
+        _remove_file(doc.stored_path)
         logger.info("Deleted file from disk: %s", doc.stored_path)
 
     # 3. Remove the metadata row from PostgreSQL
