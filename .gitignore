@@ -1,0 +1,19 @@
+cat > .gitignore << 'EOF'
+# secrets & config
+.env
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# uploaded files (don't commit user data)
+storage/*
+!storage/.gitkeep
+
+# os/editor
+.DS_Store
+.idea/
+.vscode/
+EOF
