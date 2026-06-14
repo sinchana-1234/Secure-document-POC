@@ -18,7 +18,70 @@ from app.services.embeddings import embed_query, EmbeddingError, EmbeddingConfig
 from app.services import vectorstore
 
 logger = logging.getLogger("doc-poc.rag")
+# Common greetings / chitchat that aren't document questions. Handled before any
+# embedding or vector search so we don't waste an API round-trip — and so the user
+# gets a friendly reply instead of "I couldn't find anything in the documents".
+_GREETINGS = {
+    "hi", "hii", "hiii", "hello", "helo", "hey", "heya", "yo", "hola",
+    "thanks", "thank you", "thankyou", "thx", "ty", "ok", "okay", "k",
+    "bye", "goodbye", "good morning", "good afternoon", "good evening",
+    "how are you", "sup", "what's up", "whats up",
+}
 
+_GREETING_REPLY = (
+    "Hello! I'm your document assistant. Ask me anything about your uploaded "
+    "documents — for example, what a document covers, or to summarize a section."
+)
+
+
+def is_greeting(question: str) -> bool:
+    """True if the message is a bare greeting / chitchat, not a document question."""
+    cleaned = (question or "").strip().lower().rstrip("!.?")
+    return cleaned in _GREETINGS
+
+
+def greeting_response() -> Dict[str, Any]:
+    """Friendly canned reply for greetings — same shape as answer(), no sources."""
+    return {"answer": _GREETING_REPLY, "sources": []}
+
+# ── File-retrieval intent ────────────────────────────────────────────────────
+# Some messages ask for a FILE ("get me the firewall guide"), not an answer about
+# its contents. We detect that intent and return the matching document for download,
+# instead of running Q&A (which would confusingly say "I can't find an answer").
+_FILE_VERBS = ("get", "download", "give me", "show me", "fetch", "find", "send me", "open", "pull up")
+_FILE_NOUNS = ("file", "document", "doc", "pdf", "docx", "attachment")
+
+
+def is_file_request(question: str) -> bool:
+    """True if the user is asking to retrieve a file, not asking about its contents."""
+    q = (question or "").lower()
+    has_verb = any(v in q for v in _FILE_VERBS)
+    has_noun = any(n in q for n in _FILE_NOUNS)
+    return has_verb and has_noun
+
+
+def file_response(doc) -> Dict[str, Any]:
+    """Return a matched document as a downloadable result (renders as a download chip)."""
+    title = doc.title or doc.original_filename
+    return {
+        "answer": f"Here's the document you asked for: \"{title}\". You can download it below.",
+        "sources": [{
+            "ref": 1,
+            "document_id": doc.id,
+            "title": title,
+            "doc_type": doc.doc_type,
+            "chunk_index": None,
+            "score": 1.0,
+            "snippet": doc.original_filename,
+        }],
+    }
+
+
+def file_not_found_response() -> Dict[str, Any]:
+    return {
+        "answer": "I couldn't find a document matching that name. Check the Files tab to see all your documents.",
+        "sources": [],
+    }
 
 class RagError(Exception):
     """Base class for RAG failures."""
