@@ -108,6 +108,33 @@ def list_documents(
 
     return query.order_by(Document.upload_date.desc()).offset(offset).limit(limit).all()
 
+@router.get("/paged")
+def list_documents_paged(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    q: Optional[str] = Query(None, description="keyword in title/filename/text"),
+    doc_type: Optional[str] = None,
+    limit: int = 10,
+    offset: int = 0,
+):
+    """Paged variant of the document list — returns {items, total} for table pagination."""
+    query = _scoped_query(db, user)
+    if q:
+        like = f"%{q}%"
+        query = query.filter(
+            (Document.title.ilike(like)) |
+            (Document.original_filename.ilike(like)) |
+            (Document.extracted_text.ilike(like))
+        )
+    if doc_type:
+        query = query.filter(Document.doc_type == doc_type)
+
+    total = query.count()
+    items = query.order_by(Document.upload_date.desc()).offset(offset).limit(limit).all()
+    return {
+        "items": [DocumentOut.model_validate(d) for d in items],
+        "total": total,
+    }
 
 @router.get("/{doc_id}", response_model=DocumentOut)
 def get_document(doc_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
@@ -146,3 +173,4 @@ def delete_document(doc_id: int, db: Session = Depends(get_db), user: User = Dep
     db.delete(doc)
     db.commit()
     return {"status": "deleted", "id": doc_id}
+
