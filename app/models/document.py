@@ -49,6 +49,8 @@ class Document(Base):
     duplicate_of_id   = Column(Integer, ForeignKey("documents.id", ondelete="SET NULL"), nullable=True)
 
     upload_date       = Column(DateTime, default=datetime.utcnow, index=True)
+    deleted_at        = Column(DateTime, nullable=True, index=True)
+    deleted_by        = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
 
     # back_populates="documents" completes the two-way ORM link with User.documents.
     # passive_deletes=True tells SQLAlchemy to rely on the DB CASCADE rather than
@@ -57,5 +59,6 @@ class Document(Base):
     owner = relationship(
         "User",
         back_populates="documents",
+        foreign_keys=[owner_id],   # disambiguate: this relationship uses owner_id, not deleted_by
         passive_deletes=True,
     )
