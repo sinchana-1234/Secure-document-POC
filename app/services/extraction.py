@@ -59,12 +59,17 @@ _EXT_TO_TYPE = {
     ".txt": "txt",
     ".text": "txt",
     ".md": "txt",
+    ".png": "image",
+    ".jpg": "image",
+    ".jpeg": "image",
+    ".webp": "image",
 }
 
 _MIME = {
     "pdf": "application/pdf",
     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "txt": "text/plain",
+    "image": "image/png",  # representative; actual subtype varies (png/jpg/webp)
 }
 
 _PDF_MAGIC = b"%PDF"
@@ -109,19 +114,30 @@ def extract(path: str, original_filename: str) -> ExtractionResult:
         )
 
     _validate_exists_and_nonempty(path)
-    _validate_signature(path, doc_type)
+    # Images skip the PDF/ZIP magic-byte check (different signatures); the vision
+    # call will fail clearly if the bytes aren't a real image.
+    if doc_type != "image":
+        _validate_signature(path, doc_type)
 
+    ocr_used = False
     if doc_type == "pdf":
         text, page_count = _extract_pdf(path)
         encoding = None
     elif doc_type == "docx":
         text, page_count, encoding = _extract_docx(path), None, None
+    elif doc_type == "image":
+        text = _extract_image_text(path)   # GPT-4o vision OCR
+        page_count, encoding, ocr_used = None, None, True
     else:  # txt
         text, encoding = _extract_txt(path)
         page_count = None
 
     text = _normalize(text)
     if not text:
+        if doc_type == "image":
+            raise NoExtractableTextError(
+                "No readable text was found in this image. Try a clearer photo or a file with text."
+            )
         raise NoExtractableTextError("No readable text could be extracted from the file.")
 
     result = ExtractionResult(
@@ -132,6 +148,7 @@ def extract(path: str, original_filename: str) -> ExtractionResult:
         char_count=len(text),
         word_count=len(text.split()),
         encoding=encoding,
+        ocr_used=ocr_used,
     )
     logger.info("Extracted %s: %d chars, %d words%s",
                 doc_type, result.char_count, result.word_count,
@@ -240,6 +257,54 @@ def _extract_txt(path: str):
         return raw.decode("utf-8", errors="replace"), "utf-8 (fallback)"
     return str(best), best.encoding
 
+
+# ---------------------------------------------------------------------------
+# Image OCR via GPT-4o vision — reads text/information out of an uploaded image.
+# ---------------------------------------------------------------------------
+def _extract_image_text(path: str) -> str:
+    """
+    Send the image to GPT-4o vision and return the text/information found in it.
+    We deliberately ask for extraction only (no description of the scene) so the
+    indexed text reflects what's actually written in the image.
+    """
+    import base64
+    from openai import OpenAI, OpenAIError, AuthenticationError, RateLimitError
+    from app.config import settings
+
+    if not settings.OPENAI_API_KEY:
+        raise ExtractionError("OPENAI_API_KEY is not set; image text extraction needs it.")
+
+    with open(path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    ext = os.path.splitext(path)[1].lower().lstrip(".")
+    media = "jpeg" if ext in ("jpg", "jpeg") else ext  # data-URL subtype
+
+    client = OpenAI(api_key=settings.OPENAI_API_KEY, max_retries=3, timeout=60.0)
+    try:
+        resp = client.chat.completions.create(
+            model=settings.VISION_MODEL,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text":
+                        "Extract all text and information visible in this image. "
+                        "Return only the extracted text, preserving structure where helpful. "
+                        "If there is no text, reply with an empty response."},
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/{media};base64,{b64}"}},
+                ],
+            }],
+            max_tokens=2000,
+        )
+    except AuthenticationError as e:
+        raise ExtractionError("OpenAI rejected the API key during image extraction.") from e
+    except RateLimitError as e:
+        raise ExtractionError("OpenAI rate limit hit during image extraction — try again later.") from e
+    except OpenAIError as e:
+        raise ExtractionError(f"Image text extraction failed: {e}") from e
+
+    return (resp.choices[0].message.content or "").strip()
 
 # ---------------------------------------------------------------------------
 # Output normalization

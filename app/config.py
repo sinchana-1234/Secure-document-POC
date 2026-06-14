@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     # File storage
     STORAGE_DIR: str = "storage"
     MAX_UPLOAD_MB: int = 50
-
+    VISION_MODEL: str = "gpt-4o"
     # OpenAI
     OPENAI_API_KEY: str                         # REQUIRED — from .env
     EMBEDDING_MODEL: str = "text-embedding-3-small"
