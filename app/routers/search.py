@@ -73,9 +73,18 @@ def search(payload: SearchRequest, db: Session = Depends(get_db),
     date_from_ts = int(payload.date_from.timestamp()) if payload.date_from else None
     date_to_ts = int(payload.date_to.timestamp()) if payload.date_to else None
 
+    # Exclude soft-deleted documents from RAG: their vectors still live in Pinecone
+    # (kept for restore), so we restrict the search to the set of active doc ids the
+    # caller can see. Admin sees all non-deleted docs; a user sees their own non-deleted.
+    active_q = db.query(Document.id).filter(Document.deleted_at.is_(None))
+    if user.role != Role.admin:
+        active_q = active_q.filter(Document.owner_id == user.id)
+    allowed_doc_ids = [row[0] for row in active_q.all()]
+
     metadata_filter = rag.build_metadata_filter(
         doc_type=payload.doc_type, tags=payload.tags,
-        owner_ids=owner_ids, date_from_ts=date_from_ts, date_to_ts=date_to_ts,
+        owner_ids=owner_ids, allowed_doc_ids=allowed_doc_ids,
+        date_from_ts=date_from_ts, date_to_ts=date_to_ts,
     )
 
     try:

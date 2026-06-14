@@ -135,6 +135,15 @@ def ingest(
             owner_id=owner.id,
             exclude_doc_id=doc.id,
         )
+        # A near-dup match against a soft-deleted document isn't a real duplicate —
+        # that doc is hidden from the user, so blocking their re-upload would confuse.
+        if near_id is not None:
+            still_active = db.query(Document).filter(
+                Document.id == near_id,
+                Document.deleted_at.is_(None),
+            ).first()
+            if still_active is None:
+                near_id = None
         if near_id is not None:
             doc.status = DocStatus.duplicate
             doc.duplicate_of_id = near_id

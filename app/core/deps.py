@@ -23,7 +23,10 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     if not payload or "sub" not in payload:
         raise creds_error
 
-    user = db.query(User).filter(User.id == int(payload["sub"])).first()
+    user = db.query(User).filter(
+        User.id == int(payload["sub"]),
+        User.deleted_at.is_(None),
+    ).first()
     if user is None:
         raise creds_error
     return user

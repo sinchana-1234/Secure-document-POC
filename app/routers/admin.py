@@ -35,6 +35,7 @@ Neither endpoint scales linearly with result size.
 
 import logging
 import os
+from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status as http_status
@@ -67,8 +68,7 @@ router = APIRouter(prefix="/api/admin", tags=["admin"])
 # ---------------------------------------------------------------------------
 
 def _get_user_or_404(db: Session, user_id: int) -> User:
-    """Centralised lookup — raises the same 404 shape from every endpoint."""
-    user = db.query(User).filter(User.id == user_id).first()
+    user = db.query(User).filter(User.id == user_id, User.deleted_at.is_(None)).first()
     if not user:
         raise HTTPException(
             status_code=http_status.HTTP_404_NOT_FOUND,
@@ -78,8 +78,7 @@ def _get_user_or_404(db: Session, user_id: int) -> User:
 
 
 def _get_document_or_404(db: Session, doc_id: int) -> Document:
-    """Same pattern for documents."""
-    doc = db.query(Document).filter(Document.id == doc_id).first()
+    doc = db.query(Document).filter(Document.id == doc_id, Document.deleted_at.is_(None)).first()
     if not doc:
         raise HTTPException(
             status_code=http_status.HTTP_404_NOT_FOUND,
@@ -99,15 +98,12 @@ def _remove_file(path: str) -> None:
 
 
 def _doc_count_subquery(db: Session):
-    """
-    Returns a subquery that maps owner_id → document count.
-    Used by list_users to avoid N+1 COUNT queries.
-    """
     return (
         db.query(
             Document.owner_id.label("owner_id"),
             func.count(Document.id).label("doc_count"),
         )
+        .filter(Document.deleted_at.is_(None))
         .group_by(Document.owner_id)
         .subquery()
     )
@@ -164,11 +160,11 @@ def get_stats(
     Returns aggregate counts for the admin dashboard header cards.
     All values come from COUNT queries — no full table scans.
     """
-    total_users = db.query(User).count()
-    total_docs  = db.query(Document).count()
-    indexed     = db.query(Document).filter(Document.status == DocStatus.indexed).count()
-    failed      = db.query(Document).filter(Document.status == DocStatus.failed).count()
-    duplicate   = db.query(Document).filter(Document.status == DocStatus.duplicate).count()
+    total_users = db.query(User).filter(User.deleted_at.is_(None)).count()
+    total_docs  = db.query(Document).filter(Document.deleted_at.is_(None)).count()
+    indexed     = db.query(Document).filter(Document.deleted_at.is_(None), Document.status == DocStatus.indexed).count()
+    failed      = db.query(Document).filter(Document.deleted_at.is_(None), Document.status == DocStatus.failed).count()
+    duplicate   = db.query(Document).filter(Document.deleted_at.is_(None), Document.status == DocStatus.duplicate).count()
 
     return AdminStats(
         total_users=total_users,
@@ -205,6 +201,7 @@ def list_users(
     query = (
         db.query(User, func.coalesce(counts_sq.c.doc_count, 0).label("doc_count"))
         .outerjoin(counts_sq, User.id == counts_sq.c.owner_id)
+        .filter(User.deleted_at.is_(None))
     )
 
     if role:
@@ -269,7 +266,7 @@ def get_user(
 ):
     """Returns full detail for one user, including their document upload count."""
     user = _get_user_or_404(db, user_id)
-    doc_count = db.query(Document).filter(Document.owner_id == user_id).count()
+    doc_count = db.query(Document).filter(Document.owner_id == user_id, Document.deleted_at.is_(None)).count()
     return _build_user_detail(user, doc_count)
 
 
@@ -305,7 +302,7 @@ def update_user(
     db.commit()
     db.refresh(user)
 
-    doc_count = db.query(Document).filter(Document.owner_id == user.id).count()
+    doc_count = db.query(Document).filter(Document.owner_id == user.id, Document.deleted_at.is_(None)).count()
     logger.info("Admin updated user id=%d", user.id)
     return _build_user_detail(user, doc_count)
 
@@ -336,34 +333,25 @@ def delete_user(
 
     user = _get_user_or_404(db, user_id)
 
-    # Fetch all documents belonging to this user before deleting the user row
-    docs = db.query(Document).filter(Document.owner_id == user_id).all()
-
+    now = datetime.utcnow()
+    # Soft delete: flag the user and all their documents. Files + vectors are kept
+    # so a restore can bring everything back.
+    docs = db.query(Document).filter(
+        Document.owner_id == user_id,
+        Document.deleted_at.is_(None),
+    ).all()
     for doc in docs:
-        # 1. Remove Pinecone vectors for indexed documents
-        if doc.status == DocStatus.indexed:
-            try:
-                vectorstore.delete_document(doc.id)
-            except VectorStoreAPIError as exc:
-                # Non-fatal — log and continue; DB + disk cleanup still proceeds
-                logger.warning(
-                    "Could not delete Pinecone vectors for doc %d (user %d): %s",
-                    doc.id, user_id, exc,
-                )
+        doc.deleted_at = now
+        doc.deleted_by = admin.id
 
-        # 2. Remove disk file
-        if doc.stored_path:
-            _remove_file(doc.stored_path)
-
-    # 3. Delete the user — FK cascade (ondelete="CASCADE") removes Document rows
-    db.delete(user)
+    user.deleted_at = now
+    user.deleted_by = admin.id
     db.commit()
 
     logger.info(
-        "Admin deleted user id=%d email=%s — %d documents cleaned up",
+        "Admin soft-deleted user id=%d email=%s — %d documents flagged",
         user_id, user.email, len(docs),
     )
-
 
 # ---------------------------------------------------------------------------
 # Document / File Management (admin sees ALL users' files)
@@ -390,7 +378,7 @@ def list_all_documents(
     Returns items + total for frontend pagination.
     """
     # joinedload ensures doc.owner is populated in the same query — no N+1
-    query = db.query(Document).options(joinedload(Document.owner))
+    query = db.query(Document).options(joinedload(Document.owner)).filter(Document.deleted_at.is_(None))
 
     if doc_status:
         # Convert raw string to DocStatus enum before filtering.
@@ -448,22 +436,9 @@ def delete_document(
     """
     doc = _get_document_or_404(db, doc_id)
 
-    # 1. Remove vector chunks from Pinecone
-    if doc.status == DocStatus.indexed:
-        try:
-            vectorstore.delete_document(doc.id)
-            logger.info("Deleted Pinecone vectors for document id=%d", doc.id)
-        except VectorStoreAPIError as exc:
-            # Non-fatal — Pinecone being down should not block DB + disk cleanup
-            logger.warning("Could not delete Pinecone vectors for doc %d: %s", doc.id, exc)
-
-    # 2. Remove the raw file from disk
-    if doc.stored_path:
-        _remove_file(doc.stored_path)
-        logger.info("Deleted file from disk: %s", doc.stored_path)
-
-    # 3. Remove the metadata row from PostgreSQL
-    db.delete(doc)
+    # Soft delete: flag the row, keep Pinecone vectors + disk file for restore.
+    doc.deleted_at = datetime.utcnow()
+    doc.deleted_by = _admin.id
     db.commit()
 
-    logger.info("Admin hard-deleted document id=%d filename=%s", doc_id, doc.original_filename)
+    logger.info("Admin soft-deleted document id=%d filename=%s", doc_id, doc.original_filename)

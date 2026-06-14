@@ -85,7 +85,10 @@ def find_exact_duplicate(db: Session, file_hash: str) -> Optional[Document]:
     We intentionally return the first match only; duplicates of duplicates are
     still duplicates of the original.
     """
-    match = db.query(Document).filter(Document.file_hash == file_hash).first()
+    match = db.query(Document).filter(
+        Document.file_hash == file_hash,
+        Document.deleted_at.is_(None),
+    ).first()
     if match:
         logger.info(
             "Exact duplicate detected: new file matches document id=%d (hash=%s…)",

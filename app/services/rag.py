@@ -121,11 +121,14 @@ def _clamp_top_k(top_k: Optional[int]) -> int:
 
 
 def build_metadata_filter(*, doc_type: Optional[str] = None, tags=None,
-                          owner_ids=None, date_from_ts: Optional[int] = None,
+                          owner_ids=None, allowed_doc_ids=None,
+                          date_from_ts: Optional[int] = None,
                           date_to_ts: Optional[int] = None) -> Optional[Dict[str, Any]]:
     """
     Translate UI filters into Pinecone's Mongo-style operators. owner_ids is the RBAC
     enforcement point: a non-admin's search is restricted to their own docs.
+    allowed_doc_ids restricts results to a set of (non-deleted) document ids — used to
+    exclude soft-deleted documents whose vectors still live in Pinecone.
     """
     f: Dict[str, Any] = {}
     if doc_type:
@@ -134,6 +137,8 @@ def build_metadata_filter(*, doc_type: Optional[str] = None, tags=None,
         f["tags"] = {"$in": tags if isinstance(tags, list) else [tags]}
     if owner_ids:
         f["owner_id"] = {"$in": owner_ids}
+    if allowed_doc_ids is not None:
+        f["document_id"] = {"$in": allowed_doc_ids}
     if date_from_ts is not None or date_to_ts is not None:
         rng: Dict[str, Any] = {}
         if date_from_ts is not None:

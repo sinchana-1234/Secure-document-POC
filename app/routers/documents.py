@@ -28,7 +28,8 @@ router = APIRouter(prefix="/api/documents", tags=["documents"])
 
 
 def _scoped_query(db: Session, user: User):
-    q = db.query(Document)
+    # Soft-deleted docs are excluded from all reads (list, get, download, delete).
+    q = db.query(Document).filter(Document.deleted_at.is_(None))
     if user.role != Role.admin:
         q = q.filter(Document.owner_id == user.id)
     return q
@@ -114,11 +115,16 @@ def list_documents_paged(
     user: User = Depends(get_current_user),
     q: Optional[str] = Query(None, description="keyword in title/filename/text"),
     doc_type: Optional[str] = None,
+    mine: bool = False,
     limit: int = 10,
     offset: int = 0,
 ):
-    """Paged variant of the document list — returns {items, total} for table pagination."""
+    """Paged variant of the document list — returns {items, total} for table pagination.
+    When mine=True, restrict to the caller's own documents even for admins (used by the
+    admin Upload tab, which shows only the admin's own uploads)."""
     query = _scoped_query(db, user)
+    if mine:
+        query = query.filter(Document.owner_id == user.id)
     if q:
         like = f"%{q}%"
         query = query.filter(
@@ -163,14 +169,8 @@ def delete_document(doc_id: int, db: Session = Depends(get_db), user: User = Dep
     doc = _scoped_query(db, user).filter(Document.id == doc_id).first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
-    try:
-        if doc.status == DocStatus.indexed:
-            vectorstore.delete_document(doc.id)
-    except RuntimeError:
-        pass
-    if doc.stored_path and os.path.exists(doc.stored_path):
-        os.remove(doc.stored_path)
-    db.delete(doc)
+    # Soft delete: flag the row, keep file + vectors so the document can be restored.
+    doc.deleted_at = datetime.utcnow()
+    doc.deleted_by = user.id
     db.commit()
     return {"status": "deleted", "id": doc_id}
-
