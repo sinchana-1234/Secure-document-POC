@@ -190,14 +190,12 @@ def _validate_signature(path: str, doc_type: str) -> None:
 # Per-format extractors
 # ---------------------------------------------------------------------------
 def _extract_pdf(path: str):
-    """Return (text, page_count). Raises EncryptedPDFError / CorruptFileError / NoExtractableTextError."""
+    """Return (text, page_count). Extracts the text layer AND any embedded images via vision."""
     try:
         with pdfplumber.open(path) as pdf:
             page_count = len(pdf.pages)
             parts = [(page.extract_text() or "") for page in pdf.pages]
-    except Exception as e:  # noqa: BLE001 — classify by inspecting the whole chain
-        # pdfplumber wraps the real cause, often with an empty message, so we walk the
-        # exception chain and look at each class name + message for the tell-tale words.
+    except Exception as e:  # noqa: BLE001
         blob = []
         cur = e
         while cur is not None:
@@ -210,16 +208,56 @@ def _extract_pdf(path: str):
         raise CorruptFileError(f"Could not read PDF (corrupt or malformed): {e}") from e
 
     text = "\n\n".join(p for p in parts if p.strip())
+
+    # Extract text from images embedded in the PDF (charts, screenshots, scanned pages).
+    image_texts = _extract_pdf_image_texts(path)
+    if image_texts:
+        text = (text + "\n\n" + "\n\n".join(image_texts)).strip()
+
     if len(text.strip()) < _SCANNED_PDF_MIN_CHARS:
         raise NoExtractableTextError(
-            "PDF has no extractable text layer (likely a scanned document). "
-            "OCR support is added in the OCR module."
+            "PDF has no extractable text (no text layer and no readable images)."
         )
     return text, page_count
 
 
+def _extract_pdf_image_texts(path: str) -> List[str]:
+    """Pull every embedded image from the PDF and OCR each via vision. Per-image errors are skipped."""
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        logger.warning("PyMuPDF (fitz) not installed; skipping embedded-image extraction in PDF.")
+        return []
+
+    results: List[str] = []
+    try:
+        pdf = fitz.open(path)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Could not open PDF for image extraction: %s", e)
+        return results
+
+    try:
+        for page_index in range(len(pdf)):
+            for img in pdf[page_index].get_images(full=True):
+                xref = img[0]
+                try:
+                    base = pdf.extract_image(xref)
+                    img_bytes = base["image"]
+                    ext = base.get("ext", "png")
+                    txt = _extract_image_text_from_bytes(img_bytes, media=ext)
+                    if txt:
+                        results.append(txt)
+                except ExtractionError:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("Skipped one embedded PDF image (page %d): %s", page_index, e)
+                    continue
+    finally:
+        pdf.close()
+    return results
+
 def _extract_docx(path: str) -> str:
-    """Return text from paragraphs + tables. Raises CorruptFileError on a bad archive."""
+    """Return text from paragraphs + tables + any embedded images (via vision)."""
     try:
         doc = DocxDocument(path)
     except PackageNotFoundError as e:
@@ -235,8 +273,22 @@ def _extract_docx(path: str) -> str:
             if cells:
                 parts.append(" | ".join(cells))
 
-    return "\n".join(parts)
+    # Extract text from images embedded in the DOCX (screenshots, charts, scans).
+    for rel in doc.part.rels.values():
+        if "image" in rel.reltype:
+            try:
+                img_bytes = rel.target_part.blob
+                ext = (rel.target_part.content_type or "").split("/")[-1] or "png"
+                txt = _extract_image_text_from_bytes(img_bytes, media=ext)
+                if txt:
+                    parts.append(txt)
+            except ExtractionError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Skipped one embedded DOCX image: %s", e)
+                continue
 
+    return "\n".join(parts)
 
 def _extract_txt(path: str):
     """
@@ -261,11 +313,10 @@ def _extract_txt(path: str):
 # ---------------------------------------------------------------------------
 # Image OCR via GPT-4o vision — reads text/information out of an uploaded image.
 # ---------------------------------------------------------------------------
-def _extract_image_text(path: str) -> str:
+def _extract_image_text_from_bytes(image_bytes: bytes, media: str = "png") -> str:
     """
-    Send the image to GPT-4o vision and return the text/information found in it.
-    We deliberately ask for extraction only (no description of the scene) so the
-    indexed text reflects what's actually written in the image.
+    Core vision OCR: send raw image bytes to GPT-4o vision and return extracted text.
+    Shared by standalone image uploads AND images embedded in PDFs / DOCX.
     """
     import base64
     from openai import OpenAI, OpenAIError, AuthenticationError, RateLimitError
@@ -274,11 +325,8 @@ def _extract_image_text(path: str) -> str:
     if not settings.OPENAI_API_KEY:
         raise ExtractionError("OPENAI_API_KEY is not set; image text extraction needs it.")
 
-    with open(path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode("utf-8")
-
-    ext = os.path.splitext(path)[1].lower().lstrip(".")
-    media = "jpeg" if ext in ("jpg", "jpeg") else ext  # data-URL subtype
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    media = "jpeg" if media in ("jpg", "jpeg") else media
 
     client = OpenAI(api_key=settings.OPENAI_API_KEY, max_retries=3, timeout=60.0)
     try:
@@ -305,6 +353,14 @@ def _extract_image_text(path: str) -> str:
         raise ExtractionError(f"Image text extraction failed: {e}") from e
 
     return (resp.choices[0].message.content or "").strip()
+
+
+def _extract_image_text(path: str) -> str:
+    """Standalone image upload: read the file and run vision OCR on its bytes."""
+    with open(path, "rb") as f:
+        data = f.read()
+    ext = os.path.splitext(path)[1].lower().lstrip(".")
+    return _extract_image_text_from_bytes(data, media=ext)
 
 # ---------------------------------------------------------------------------
 # Output normalization

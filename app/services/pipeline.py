@@ -118,6 +118,24 @@ def ingest(
         doc.mime_type = result.mime_type
         doc.extracted_text = result.text[:200_000]
 
+        # ── AI Firewall checkpoint (input): scan the document for prompt injection ──
+        from app.security.firewall import firewall
+        from app.config import settings as _settings
+        detection = firewall.scan_document(result.text)
+        if detection.is_suspicious:
+            logger.warning(
+                "Firewall flagged document id=%s severity=%s categories=%s",
+                doc.id, detection.severity, ",".join(detection.matched_categories),
+            )
+            if _settings.FIREWALL_MODE == "enforce":
+                doc.status = DocStatus.failed
+                doc.error_message = "Blocked by security firewall (possible injected instructions)."
+                db.commit()
+                raise DuplicateError(
+                    "This document was blocked by the security firewall.",
+                    existing_id=doc.id, kind="firewall",
+                )
+
         chunks = chunk_text(result.text)
         if not chunks:
             doc.status = DocStatus.failed

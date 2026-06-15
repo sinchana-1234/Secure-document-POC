@@ -14,6 +14,7 @@ from app.models import User, Role, Document
 from app.schemas import SearchRequest, SearchResponse
 from app.services import rag
 from app.services.rag import RagInputError, RagConfigError, RagAPIError
+from app.security.firewall import firewall
 
 router = APIRouter(prefix="/api/search", tags=["search"])
 
@@ -56,6 +57,17 @@ def search(payload: SearchRequest, db: Session = Depends(get_db),
     if not payload.question or not payload.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
+    # ── AI Firewall checkpoint (input): scan the user's question ──
+    # Monitor mode logs only; enforce mode raises PromptInjectionError → 400.
+    from ai_firewall.errors import PromptInjectionError
+    try:
+        firewall.guard_input(payload.question)
+    except PromptInjectionError:
+        raise HTTPException(
+            status_code=400,
+            detail="Your message was blocked by the security firewall.",
+        )
+
     # Greetings / chitchat: reply conversationally without searching the documents.
     if rag.is_greeting(payload.question):
         return SearchResponse(**rag.greeting_response())
@@ -96,5 +108,11 @@ def search(payload: SearchRequest, db: Session = Depends(get_db),
         raise HTTPException(status_code=503, detail=str(e))
     except RagAPIError as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+     # ── AI Firewall checkpoint (output): sanitize the answer before returning ──
+    # guard_output never raises (sanitize-only) — it redacts any injected/echoed
+    # payload the model may have parroted back from document content.
+    if isinstance(result, dict) and isinstance(result.get("answer"), str):
+        result["answer"] = firewall.guard_output(result["answer"])
 
     return SearchResponse(**result)

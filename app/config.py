@@ -52,6 +52,8 @@ class Settings(BaseSettings):
     # OCR
     OCR_LANG: str = "eng"
 
+    FIREWALL_MODE: str = "monitor"
+
     # ------------------------------------------------------------------
     # Field-level validators
     # These run per-field at parse time so misconfiguration is caught at
