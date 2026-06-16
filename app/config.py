@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     # Near-duplicate detection threshold (cosine similarity, 0–1)
     # 0.96 catches re-exports and minor edits; lower it to catch looser copies.
     NEAR_DUP_THRESHOLD: float = 0.96
+    FIREWALL_MODE: str = "monitor"
 
     # OCR
     OCR_LANG: str = "eng"

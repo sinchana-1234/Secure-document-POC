@@ -31,11 +31,11 @@ from app.models import Document, DocStatus
 from app.services import dedup, embeddings, extraction, vectorstore
 from app.utils.chunking import chunk_text
 from app.utils.hashing import sha256_of_bytes
+from app.security.firewall import firewall
+
 
 logger = logging.getLogger("doc-poc.pipeline")
 
-import logging
-logger = logging.getLogger("doc-poc.pipeline")
 
 class DuplicateError(Exception):
     def __init__(self, message: str, existing_id: int, kind: str, score: float = None):
@@ -45,10 +45,14 @@ class DuplicateError(Exception):
         self.score = score
 
 
+class FirewallBlockedError(Exception):
+    """Raised when the AI firewall blocks a document in enforce mode."""
+
+
 def _save_file(file_bytes: bytes, original_filename: str) -> str:
     os.makedirs(settings.STORAGE_DIR, exist_ok=True)
     ext = os.path.splitext(original_filename)[1].lower()
-    stored_name = f"{uuid.uuid4().hex}{ext}"  # UUID name → no path traversal, no collisions
+    stored_name = f"{uuid.uuid4().hex}{ext}"
     stored_path = os.path.join(settings.STORAGE_DIR, stored_name)
     with open(stored_path, "wb") as f:
         f.write(file_bytes)
@@ -119,21 +123,19 @@ def ingest(
         doc.extracted_text = result.text[:200_000]
 
         # ── AI Firewall checkpoint (input): scan the document for prompt injection ──
-        from app.security.firewall import firewall
-        from app.config import settings as _settings
         detection = firewall.scan_document(result.text)
         if detection.is_suspicious:
             logger.warning(
                 "Firewall flagged document id=%s severity=%s categories=%s",
                 doc.id, detection.severity, ",".join(detection.matched_categories),
             )
-            if _settings.FIREWALL_MODE == "enforce":
+            if settings.FIREWALL_MODE == "enforce":
                 doc.status = DocStatus.failed
                 doc.error_message = "Blocked by security firewall (possible injected instructions)."
                 db.commit()
-                raise DuplicateError(
-                    "This document was blocked by the security firewall.",
-                    existing_id=doc.id, kind="firewall",
+                _remove_file(stored_path)
+                raise FirewallBlockedError(
+                    "This document was blocked by the security firewall."
                 )
 
         chunks = chunk_text(result.text)
@@ -141,11 +143,11 @@ def ingest(
             doc.status = DocStatus.failed
             doc.error_message = "No extractable text found (empty or unreadable document)."
             db.commit()
-            # File kept: the document record references it; admin may want to inspect it.
             return doc
 
         # 4. Embed all chunks
         vectors = embeddings.embed_texts(chunks)
+
         # 5. NEAR-duplicate check — scoped to this owner, self-excluded so a
         #    re-processed document cannot match its own previously upserted vectors.
         near_id, score = dedup.find_near_duplicate(
@@ -162,6 +164,7 @@ def ingest(
             ).first()
             if still_active is None:
                 near_id = None
+
         if near_id is not None:
             doc.status = DocStatus.duplicate
             doc.duplicate_of_id = near_id
@@ -169,8 +172,6 @@ def ingest(
                 f"Near-duplicate of document {near_id} (similarity {score:.3f})."
             )
             db.commit()
-            # Remove the physical file — the document is a duplicate and will
-            # not be indexed, so there is no reason to keep the bytes on disk.
             _remove_file(stored_path)
             raise DuplicateError(
                 f"Near-duplicate of document {near_id} (similarity {score:.3f}).",
@@ -197,14 +198,10 @@ def ingest(
         db.refresh(doc)
         return doc
 
-    except DuplicateError:
-        # Already handled above (status set, file removed) — just re-raise.
+    except (DuplicateError, FirewallBlockedError):
         raise
 
     except Exception as exc:
-        # Mark the DB record as failed so operators can see it, then clean up
-        # the physical file — a failed document has no valid indexed state so
-        # keeping the bytes serves no purpose and wastes disk space.
         doc.status = DocStatus.failed
         doc.error_message = str(exc)[:1000]
         db.commit()

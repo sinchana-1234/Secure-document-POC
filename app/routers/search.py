@@ -15,6 +15,7 @@ from app.schemas import SearchRequest, SearchResponse
 from app.services import rag
 from app.services.rag import RagInputError, RagConfigError, RagAPIError
 from app.security.firewall import firewall
+from ai_firewall.errors import PromptInjectionError
 
 router = APIRouter(prefix="/api/search", tags=["search"])
 
@@ -60,12 +61,15 @@ def search(payload: SearchRequest, db: Session = Depends(get_db),
     # ── AI Firewall checkpoint (input): scan the user's question ──
     # Monitor mode logs only; enforce mode raises PromptInjectionError → 400.
     from ai_firewall.errors import PromptInjectionError
+    # The detail message is intentionally generic — we never expose to the user
+    # that a firewall exists or what triggered the block.
     try:
         firewall.guard_input(payload.question)
     except PromptInjectionError:
         raise HTTPException(
             status_code=400,
             detail="Your message was blocked by the security firewall.",
+            detail="I'm sorry, that request couldn't be processed. Please try a different question.",
         )
 
     # Greetings / chitchat: reply conversationally without searching the documents.
@@ -114,5 +118,12 @@ def search(payload: SearchRequest, db: Session = Depends(get_db),
     # payload the model may have parroted back from document content.
     if isinstance(result, dict) and isinstance(result.get("answer"), str):
         result["answer"] = firewall.guard_output(result["answer"])
+    # ── AI Firewall checkpoint (output): sanitize the answer before returning ──
+    # guard_output never raises (sanitize-only) — it redacts any injected/echoed
+    # payload the model may have parroted back from document content.
+    # Unconditional: always run, even if answer is empty, so the guard can never
+    # be silently skipped by a shape change in the result dict.
+    answer_text = result.get("answer", "") if isinstance(result, dict) else ""
+    result["answer"] = firewall.guard_output(answer_text)
 
     return SearchResponse(**result)

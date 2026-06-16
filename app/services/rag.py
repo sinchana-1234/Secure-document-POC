@@ -16,6 +16,7 @@ from openai import OpenAI, OpenAIError, AuthenticationError, RateLimitError
 from app.config import settings
 from app.services.embeddings import embed_query, EmbeddingError, EmbeddingConfigError
 from app.services import vectorstore
+from app.security.firewall import firewall
 
 logger = logging.getLogger("doc-poc.rag")
 # Common greetings / chitchat that aren't document questions. Handled before any
@@ -185,6 +186,16 @@ def answer(question: str, matches: List[Dict[str, Any]]) -> Dict[str, Any]:
             "answer": "I couldn't find anything relevant in the documents you have access to.",
             "sources": [],
         }
+
+    # ── AI Firewall checkpoint (retrieval): sanitize chunks before they enter the LLM prompt ──
+    # filter_retrieval redacts any injected instructions that slipped past the upload-time
+    # scan — e.g. "Ignore previous instructions..." buried in document text. This is the
+    # critical last-line-of-defense before poisoned content reaches the model context.
+    firewall.filter_retrieval(
+        matches,
+        text_of=lambda m: (m.get("metadata") or {}).get("text", ""),
+        set_text=lambda m, t: (m.get("metadata") or {}).update({"text": t}),
+    )
 
     context_lines: List[str] = []
     sources: List[Dict[str, Any]] = []

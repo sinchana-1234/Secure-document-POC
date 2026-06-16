@@ -7,6 +7,7 @@ AI Firewall gateway — a single shared Firewall instance used at every checkpoi
 Mode is driven by settings.FIREWALL_MODE:
   "monitor" — detect + log only, never blocks (safe dry-run; default)
   "enforce" — raises PromptInjectionError on malicious input
+
 Flip via .env (FIREWALL_MODE=enforce) once monitoring confirms no false positives.
 """
 import logging

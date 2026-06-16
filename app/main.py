@@ -22,6 +22,11 @@ logger = logging.getLogger("doc-intel")
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     logger.info("Starting %s (env=%s)", settings.APP_NAME, settings.ENV)
+    if settings.ENV == "prod" and settings.FIREWALL_MODE == "monitor":
+        logger.warning(
+            "SECURITY: Firewall is in MONITOR mode — attacks are logged but NOT blocked. "
+            "Set FIREWALL_MODE=enforce in .env before going live."
+        )
     Base.metadata.create_all(bind=engine)
     from app.services import vectorstore
     try:
@@ -52,4 +57,4 @@ def health():
 app.include_router(auth.router)
 app.include_router(documents.router)
 app.include_router(search.router)
-app.include_router(admin.router)   # <-- added admin router
+app.include_router(admin.router)  

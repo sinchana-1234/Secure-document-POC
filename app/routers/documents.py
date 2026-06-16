@@ -18,7 +18,7 @@ from app.database import get_db
 from app.models import User, Role, Document, DocStatus
 from app.schemas import DocumentOut, UploadResponse
 from app.services import vectorstore
-from app.services.pipeline import ingest, DuplicateError
+from app.services.pipeline import ingest, DuplicateError, FirewallBlockedError
 from app.services.extraction import ExtractionError
 from app.services.embeddings import EmbeddingError
 from app.services.vectorstore import VectorStoreError
@@ -62,6 +62,8 @@ async def upload(
     except DuplicateError as e:
         return UploadResponse(status="duplicate", message=str(e), duplicate_of_id=e.existing_id,
                               duplicate_kind=e.kind, similarity=e.score)
+    except FirewallBlockedError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
